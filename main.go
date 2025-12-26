@@ -1,42 +1,66 @@
 package main
 
 import (
+    "database/sql"
+    "encoding/json"
     "fmt"
     "log"
     "net/http"
     "os"
+    "time"
 
     "github.com/go-chi/chi/v5"
     "github.com/go-chi/cors"
     "github.com/joho/godotenv"
-    "encoding/json"
+    "github.com/google/uuid"
+    _ "github.com/lib/pq"
+
+    "github.com/mdbailin/go-rss-server/internal/database"
 )
 
+type apiConfig struct {
+    DB *database.Queries
+}
+
 func main() {
-    // Load environment variables
     godotenv.Load()
 
     port := os.Getenv("PORT")
+    dbURL := os.Getenv("DB_URL")
+
+    db, err := sql.Open("postgres", dbURL)
+    if err != nil {
+        log.Fatalf("failed to open db: %v", err)
+    }
+    defer db.Close()
+
+    dbQueries := database.New(db)
+
+    cfg := apiConfig{
+        DB: dbQueries,
+    }
+
+    fmt.Println("Connected to DB!")
     fmt.Println("Server starting on port:", port)
 
     r := chi.NewRouter()
 
-    // Apply CORS middleware
     r.Use(cors.Handler(cors.Options{
-        AllowedOrigins:   []string{"*"}, // allow all origins now
+        AllowedOrigins:   []string{"*"},
         AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
         AllowedHeaders:   []string{"*"},
         AllowCredentials: false,
     }))
 
-    // Create /v1 subrouter
     r.Route("/v1", func(v1 chi.Router) {
-	 v1.Get("/readiness", func(w http.ResponseWriter, r *http.Request) {
-       		 respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-    	})
-	v1.Get("/err", func(w http.ResponseWriter, r *http.Request) {
-    		respondWithError(w, http.StatusInternalServerError, "Internal Server Error")
-	})
+        v1.Get("/readiness", func(w http.ResponseWriter, r *http.Request) {
+            respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+        })
+        v1.Get("/err", func(w http.ResponseWriter, r *http.Request) {
+            respondWithError(w, http.StatusInternalServerError, "Internal Server Error")
+        })
+
+	v1.Post("/users", cfg.handleCreateUser)
 
     })
 
@@ -61,4 +85,39 @@ func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 // respondWithError is a helper that formats an error JSON
 func respondWithError(w http.ResponseWriter, code int, msg string) {
     respondWithJSON(w, code, map[string]string{"error": msg})
+}
+
+func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+    type requestBody struct {
+        Name string `json:"name"`
+    }
+
+    decoder := json.NewDecoder(r.Body)
+    params := requestBody{}
+    if err := decoder.Decode(&params); err != nil {
+        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        return
+    }
+
+    if params.Name == "" {
+        respondWithError(w, http.StatusBadRequest, "name is required")
+        return
+    }
+
+    // Create UUID + timestamps
+    id := uuid.New()
+    now := time.Now().UTC()
+
+    user, err := cfg.DB.CreateUser(r.Context(), database.CreateUserParams{
+        ID:        id,
+        CreatedAt: now,
+        UpdatedAt: now,
+        Name:      params.Name,
+    })
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not create user")
+        return
+    }
+
+    respondWithJSON(w, http.StatusCreated, user)
 }
