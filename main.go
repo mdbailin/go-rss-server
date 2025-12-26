@@ -8,6 +8,7 @@ import (
     "net/http"
     "os"
     "time"
+    "strings"
 
     "github.com/go-chi/chi/v5"
     "github.com/go-chi/cors"
@@ -62,6 +63,7 @@ func main() {
 
 	v1.Post("/users", cfg.handleCreateUser)
 
+	v1.Post("/feeds", cfg.middlewareAuth(cfg.handleCreateFeed))
     })
 
     srv := &http.Server{
@@ -87,6 +89,34 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
     respondWithJSON(w, code, map[string]string{"error": msg})
 }
 
+type authedHandler func(http.ResponseWriter, *http.Request, database.User)
+
+func (cfg *apiConfig) middlewareAuth(handler authedHandler) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        authHeader := r.Header.Get("Authorization")
+
+        const prefix = "ApiKey "
+        if !strings.HasPrefix(authHeader, prefix) {
+            respondWithError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
+            return
+        }
+
+        apiKey := strings.TrimPrefix(authHeader, prefix)
+        if apiKey == "" {
+            respondWithError(w, http.StatusUnauthorized, "invalid api key")
+            return
+        }
+
+        user, err := cfg.DB.GetUserByAPIKey(r.Context(), apiKey)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, "invalid api key or user missing")
+            return
+        }
+
+        handler(w, r, user)
+    }
+}
+
 func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
     type requestBody struct {
         Name string `json:"name"`
@@ -104,8 +134,8 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Create UUID + timestamps
     id := uuid.New()
+    apiKey := uuid.NewString()
     now := time.Now().UTC()
 
     user, err := cfg.DB.CreateUser(r.Context(), database.CreateUserParams{
@@ -113,6 +143,7 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
         CreatedAt: now,
         UpdatedAt: now,
         Name:      params.Name,
+        ApiKey:    apiKey,
     })
     if err != nil {
         respondWithError(w, http.StatusInternalServerError, "could not create user")
@@ -120,4 +151,41 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
     }
 
     respondWithJSON(w, http.StatusCreated, user)
+}
+
+func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, user database.User) {
+    type requestBody struct {
+        Name string `json:"name"`
+        URL  string `json:"url"`
+    }
+
+    decoder := json.NewDecoder(r.Body)
+    params := requestBody{}
+    if err := decoder.Decode(&params); err != nil {
+        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        return
+    }
+
+    if params.Name == "" || params.URL == "" {
+        respondWithError(w, http.StatusBadRequest, "name and url are required")
+        return
+    }
+
+    id := uuid.New()
+    now := time.Now().UTC()
+
+    feed, err := cfg.DB.CreateFeed(r.Context(), database.CreateFeedParams{
+        ID:        id,
+        CreatedAt: now,
+        UpdatedAt: now,
+        Name:      params.Name,
+        Url:       params.URL,
+        UserID:    user.ID,
+    })
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not create feed")
+        return
+    }
+
+    respondWithJSON(w, http.StatusCreated, feed)
 }
