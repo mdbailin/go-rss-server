@@ -64,6 +64,14 @@ func main() {
 	v1.Post("/users", cfg.handleCreateUser)
 
 	v1.Post("/feeds", cfg.middlewareAuth(cfg.handleCreateFeed))
+
+	v1.Get("/feeds", cfg.handleGetFeeds)
+
+	v1.Post("/feed_follows", cfg.middlewareAuth(cfg.handleCreateFeedFollow))
+
+	v1.Get("/feed_follows", cfg.middlewareAuth(cfg.handleGetFeedFollows))
+
+	v1.Delete("/feed_follows/{feedFollowID}", cfg.middlewareAuth(cfg.handleDeleteFeedFollow))
     })
 
     srv := &http.Server{
@@ -171,11 +179,12 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
         return
     }
 
-    id := uuid.New()
     now := time.Now().UTC()
 
+    // 1. Create the feed
+    feedID := uuid.New()
     feed, err := cfg.DB.CreateFeed(r.Context(), database.CreateFeedParams{
-        ID:        id,
+        ID:        feedID,
         CreatedAt: now,
         UpdatedAt: now,
         Name:      params.Name,
@@ -187,5 +196,115 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
         return
     }
 
-    respondWithJSON(w, http.StatusCreated, feed)
+    // 2. Auto-create follow
+    followID := uuid.New()
+    follow, err := cfg.DB.CreateFeedFollow(r.Context(), database.CreateFeedFollowParams{
+        ID:        followID,
+        CreatedAt: now,
+        UpdatedAt: now,
+        FeedID:    feed.ID,
+        UserID:    user.ID,
+    })
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not create feed follow")
+        return
+    }
+
+    // 3. Return both
+    type response struct {
+        Feed       database.Feed       `json:"feed"`
+        FeedFollow database.FeedFollow `json:"feed_follow"`
+    }
+
+    respondWithJSON(w, http.StatusCreated, response{
+        Feed:       feed,
+        FeedFollow: follow,
+    })
+}
+
+func (cfg *apiConfig) handleGetFeeds(w http.ResponseWriter, r *http.Request) {
+    feeds, err := cfg.DB.GetFeeds(r.Context())
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not get feeds")
+        return
+    }
+
+    respondWithJSON(w, http.StatusOK, feeds)
+}
+
+func (cfg *apiConfig) handleCreateFeedFollow(w http.ResponseWriter, r *http.Request, user database.User) {
+    type requestBody struct {
+        FeedID string `json:"feed_id"`
+    }
+
+    decoder := json.NewDecoder(r.Body)
+    params := requestBody{}
+    if err := decoder.Decode(&params); err != nil {
+        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        return
+    }
+
+    if params.FeedID == "" {
+        respondWithError(w, http.StatusBadRequest, "feed_id is required")
+        return
+    }
+
+    feedID, err := uuid.Parse(params.FeedID)
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, "invalid feed_id")
+        return
+    }
+
+    id := uuid.New()
+    now := time.Now().UTC()
+
+    follow, err := cfg.DB.CreateFeedFollow(r.Context(), database.CreateFeedFollowParams{
+        ID:        id,
+        CreatedAt: now,
+        UpdatedAt: now,
+        FeedID:    feedID,
+        UserID:    user.ID,
+    })
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not create feed follow")
+        return
+    }
+
+    respondWithJSON(w, http.StatusCreated, follow)
+}
+
+func (cfg *apiConfig) handleGetFeedFollows(w http.ResponseWriter, r *http.Request, user database.User) {
+    follows, err := cfg.DB.GetFeedFollowsForUser(r.Context(), user.ID)
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not get feed follows")
+        return
+    }
+
+    respondWithJSON(w, http.StatusOK, follows)
+}
+
+func (cfg *apiConfig) handleDeleteFeedFollow(w http.ResponseWriter, r *http.Request, user database.User) {
+    feedFollowIDStr := chi.URLParam(r, "feedFollowID")
+    if feedFollowIDStr == "" {
+        respondWithError(w, http.StatusBadRequest, "feedFollowID is required")
+        return
+    }
+
+    feedFollowID, err := uuid.Parse(feedFollowIDStr)
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, "invalid feedFollowID")
+        return
+    }
+
+    err = cfg.DB.DeleteFeedFollow(r.Context(), database.DeleteFeedFollowParams{
+        ID:     feedFollowID,
+        UserID: user.ID,
+    })
+    if err != nil {
+        // could refine (e.g. 404), but 400/500 is OK for now
+        respondWithError(w, http.StatusInternalServerError, "could not delete feed follow")
+        return
+    }
+
+    respondWithJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
