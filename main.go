@@ -9,6 +9,7 @@ import (
     "os"
     "time"
     "strings"
+    "context"
 
     "github.com/go-chi/chi/v5"
     "github.com/go-chi/cors"
@@ -17,10 +18,51 @@ import (
     _ "github.com/lib/pq"
 
     "github.com/mdbailin/go-rss-server/internal/database"
+   // "github.com/mdbailin/go-rss-server/internal/rss"
+    "github.com/mdbailin/go-rss-server/internal/worker"
+    "github.com/mdbailin/go-rss-server/internal/httputil"
 )
 
 type apiConfig struct {
     DB *database.Queries
+}
+
+//debugging
+func (cfg *apiConfig) debugTestNextFeeds() {
+    ctx := context.Background()
+
+    feeds, err := cfg.DB.GetNextFeedsToFetch(ctx, 10)
+    if err != nil {
+        log.Printf("GetNextFeedsToFetch error: %v", err)
+        return
+    }
+
+    log.Printf("Next feeds to fetch (%d):", len(feeds))
+    for _, f := range feeds {
+        log.Printf("  id=%s name=%q last_fetched_at=%v", f.ID, f.Name, f.LastFetchedAt)
+    }
+
+    if len(feeds) == 0 {
+        return
+    }
+
+    // Mark the first one as fetched
+    first := feeds[0]
+    if err := cfg.DB.MarkFeedFetched(ctx, first.ID); err != nil {
+        log.Printf("MarkFeedFetched error: %v", err)
+        return
+    }
+    log.Printf("Marked feed %s as fetched", first.ID)
+}
+
+type Feed struct {
+    ID            uuid.UUID  `json:"id"`
+    CreatedAt     time.Time  `json:"created_at"`
+    UpdatedAt     time.Time  `json:"updated_at"`
+    Name          string     `json:"name"`
+    URL           string     `json:"url"`
+    UserID        uuid.UUID  `json:"user_id"`
+    LastFetchedAt *time.Time `json:"last_fetched_at"`
 }
 
 func main() {
@@ -41,8 +83,13 @@ func main() {
         DB: dbQueries,
     }
 
+    //rss.DebugTestFetchRSS()
+    go worker.RunFeedWorker(cfg.DB, time.Minute, 10)
+
     fmt.Println("Connected to DB!")
     fmt.Println("Server starting on port:", port)
+
+   // cfg.debugTestNextFeeds()
 
     r := chi.NewRouter()
 
@@ -55,10 +102,10 @@ func main() {
 
     r.Route("/v1", func(v1 chi.Router) {
         v1.Get("/readiness", func(w http.ResponseWriter, r *http.Request) {
-            respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+            httputil.RespondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
         })
         v1.Get("/err", func(w http.ResponseWriter, r *http.Request) {
-            respondWithError(w, http.StatusInternalServerError, "Internal Server Error")
+            httputil.RespondWithError(w, http.StatusInternalServerError, "Internal Server Error")
         })
 
 	v1.Post("/users", cfg.handleCreateUser)
@@ -66,6 +113,10 @@ func main() {
 	v1.Post("/feeds", cfg.middlewareAuth(cfg.handleCreateFeed))
 
 	v1.Get("/feeds", cfg.handleGetFeeds)
+
+	v1.Get("/posts", cfg.handleGetPosts)
+
+	v1.Get("/posts/{postID}", cfg.handleGetPostByID)
 
 	v1.Post("/feed_follows", cfg.middlewareAuth(cfg.handleCreateFeedFollow))
 
@@ -82,21 +133,6 @@ func main() {
     log.Fatal(srv.ListenAndServe())
 }
 
-// respondWithJSON writes status + JSON payload
-func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(status)
-
-    jsonBytes, _ := json.Marshal(payload)
-    jsonBytes = append(jsonBytes, byte('\n'))
-    w.Write(jsonBytes)
-}
-
-// respondWithError is a helper that formats an error JSON
-func respondWithError(w http.ResponseWriter, code int, msg string) {
-    respondWithJSON(w, code, map[string]string{"error": msg})
-}
-
 type authedHandler func(http.ResponseWriter, *http.Request, database.User)
 
 func (cfg *apiConfig) middlewareAuth(handler authedHandler) http.HandlerFunc {
@@ -105,24 +141,50 @@ func (cfg *apiConfig) middlewareAuth(handler authedHandler) http.HandlerFunc {
 
         const prefix = "ApiKey "
         if !strings.HasPrefix(authHeader, prefix) {
-            respondWithError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
+            httputil.RespondWithError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
             return
         }
 
         apiKey := strings.TrimPrefix(authHeader, prefix)
         if apiKey == "" {
-            respondWithError(w, http.StatusUnauthorized, "invalid api key")
+            httputil.RespondWithError(w, http.StatusUnauthorized, "invalid api key")
             return
         }
 
         user, err := cfg.DB.GetUserByAPIKey(r.Context(), apiKey)
         if err != nil {
-            respondWithError(w, http.StatusUnauthorized, "invalid api key or user missing")
+            httputil.RespondWithError(w, http.StatusUnauthorized, "invalid api key or user missing")
             return
         }
 
         handler(w, r, user)
     }
+}
+
+func (cfg *apiConfig) handleGetPosts(w http.ResponseWriter, r *http.Request) {
+    posts, err := cfg.DB.GetPosts(r.Context()) 
+    if err != nil {
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not get posts")
+        return
+    }
+    httputil.RespondWithJSON(w, http.StatusOK, posts)
+}
+
+func (cfg *apiConfig) handleGetPostByID(w http.ResponseWriter, r *http.Request) {
+    idStr := chi.URLParam(r, "postID")
+    id, err := uuid.Parse(idStr)
+    if err != nil {
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid postID")
+        return
+    }
+
+    post, err := cfg.DB.GetPost(r.Context(), id) // new sqlc query
+    if err != nil {
+        httputil.RespondWithError(w, http.StatusNotFound, "post not found")
+        return
+    }
+
+    httputil.RespondWithJSON(w, http.StatusOK, post)
 }
 
 func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -133,12 +195,12 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
     decoder := json.NewDecoder(r.Body)
     params := requestBody{}
     if err := decoder.Decode(&params); err != nil {
-        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid JSON")
         return
     }
 
     if params.Name == "" {
-        respondWithError(w, http.StatusBadRequest, "name is required")
+        httputil.RespondWithError(w, http.StatusBadRequest, "name is required")
         return
     }
 
@@ -154,11 +216,11 @@ func (cfg *apiConfig) handleCreateUser(w http.ResponseWriter, r *http.Request) {
         ApiKey:    apiKey,
     })
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not create user")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not create user")
         return
     }
 
-    respondWithJSON(w, http.StatusCreated, user)
+    httputil.RespondWithJSON(w, http.StatusCreated, user)
 }
 
 func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, user database.User) {
@@ -170,12 +232,12 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
     decoder := json.NewDecoder(r.Body)
     params := requestBody{}
     if err := decoder.Decode(&params); err != nil {
-        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid JSON")
         return
     }
 
     if params.Name == "" || params.URL == "" {
-        respondWithError(w, http.StatusBadRequest, "name and url are required")
+        httputil.RespondWithError(w, http.StatusBadRequest, "name and url are required")
         return
     }
 
@@ -192,7 +254,7 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
         UserID:    user.ID,
     })
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not create feed")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not create feed")
         return
     }
 
@@ -206,18 +268,18 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
         UserID:    user.ID,
     })
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not create feed follow")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not create feed follow")
         return
     }
 
     // 3. Return both
     type response struct {
-        Feed       database.Feed       `json:"feed"`
+        Feed       Feed       `json:"feed"`
         FeedFollow database.FeedFollow `json:"feed_follow"`
     }
 
-    respondWithJSON(w, http.StatusCreated, response{
-        Feed:       feed,
+    httputil.RespondWithJSON(w, http.StatusCreated, response{
+        Feed:       databaseFeedToFeed(feed),
         FeedFollow: follow,
     })
 }
@@ -225,11 +287,11 @@ func (cfg *apiConfig) handleCreateFeed(w http.ResponseWriter, r *http.Request, u
 func (cfg *apiConfig) handleGetFeeds(w http.ResponseWriter, r *http.Request) {
     feeds, err := cfg.DB.GetFeeds(r.Context())
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not get feeds")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not get feeds")
         return
     }
 
-    respondWithJSON(w, http.StatusOK, feeds)
+    httputil.RespondWithJSON(w, http.StatusOK, databaseFeedsToFeeds(feeds))
 }
 
 func (cfg *apiConfig) handleCreateFeedFollow(w http.ResponseWriter, r *http.Request, user database.User) {
@@ -240,18 +302,18 @@ func (cfg *apiConfig) handleCreateFeedFollow(w http.ResponseWriter, r *http.Requ
     decoder := json.NewDecoder(r.Body)
     params := requestBody{}
     if err := decoder.Decode(&params); err != nil {
-        respondWithError(w, http.StatusBadRequest, "invalid JSON")
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid JSON")
         return
     }
 
     if params.FeedID == "" {
-        respondWithError(w, http.StatusBadRequest, "feed_id is required")
+        httputil.RespondWithError(w, http.StatusBadRequest, "feed_id is required")
         return
     }
 
     feedID, err := uuid.Parse(params.FeedID)
     if err != nil {
-        respondWithError(w, http.StatusBadRequest, "invalid feed_id")
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid feed_id")
         return
     }
 
@@ -266,33 +328,33 @@ func (cfg *apiConfig) handleCreateFeedFollow(w http.ResponseWriter, r *http.Requ
         UserID:    user.ID,
     })
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not create feed follow")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not create feed follow")
         return
     }
 
-    respondWithJSON(w, http.StatusCreated, follow)
+    httputil.RespondWithJSON(w, http.StatusCreated, follow)
 }
 
 func (cfg *apiConfig) handleGetFeedFollows(w http.ResponseWriter, r *http.Request, user database.User) {
     follows, err := cfg.DB.GetFeedFollowsForUser(r.Context(), user.ID)
     if err != nil {
-        respondWithError(w, http.StatusInternalServerError, "could not get feed follows")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not get feed follows")
         return
     }
 
-    respondWithJSON(w, http.StatusOK, follows)
+    httputil.RespondWithJSON(w, http.StatusOK, follows)
 }
 
 func (cfg *apiConfig) handleDeleteFeedFollow(w http.ResponseWriter, r *http.Request, user database.User) {
     feedFollowIDStr := chi.URLParam(r, "feedFollowID")
     if feedFollowIDStr == "" {
-        respondWithError(w, http.StatusBadRequest, "feedFollowID is required")
+        httputil.RespondWithError(w, http.StatusBadRequest, "feedFollowID is required")
         return
     }
 
     feedFollowID, err := uuid.Parse(feedFollowIDStr)
     if err != nil {
-        respondWithError(w, http.StatusBadRequest, "invalid feedFollowID")
+        httputil.RespondWithError(w, http.StatusBadRequest, "invalid feedFollowID")
         return
     }
 
@@ -302,9 +364,35 @@ func (cfg *apiConfig) handleDeleteFeedFollow(w http.ResponseWriter, r *http.Requ
     })
     if err != nil {
         // could refine (e.g. 404), but 400/500 is OK for now
-        respondWithError(w, http.StatusInternalServerError, "could not delete feed follow")
+        httputil.RespondWithError(w, http.StatusInternalServerError, "could not delete feed follow")
         return
     }
 
-    respondWithJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+    httputil.RespondWithJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func databaseFeedToFeed(f database.Feed) Feed {
+    var lastFetched *time.Time
+    if f.LastFetchedAt.Valid {
+        t := f.LastFetchedAt.Time
+        lastFetched = &t
+    }
+
+    return Feed{
+        ID:            f.ID,
+        CreatedAt:     f.CreatedAt,
+        UpdatedAt:     f.UpdatedAt,
+        Name:          f.Name,
+        URL:           f.Url,
+        UserID:        f.UserID,
+        LastFetchedAt: lastFetched,
+    }
+}
+
+func databaseFeedsToFeeds(feeds []database.Feed) []Feed {
+    out := make([]Feed, 0, len(feeds))
+    for _, f := range feeds {
+        out = append(out, databaseFeedToFeed(f))
+    }
+    return out
 }
