@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+API_BASE="${API_BASE:-http://localhost:8080}"
+
+curl -s "${API_BASE}/v1/posts" \
+  | jq -r '
+      to_entries[]
+      | "\(.key)\t\(.value.ID)\t\(.value.Title)\t\(.value.Url)"
+    '

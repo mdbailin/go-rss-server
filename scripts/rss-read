@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <post-id | index>" >&2
+  exit 1
+fi
+
+ARG="$1"
+API_BASE="${API_BASE:-http://localhost:8080}"
+
+get_url_by_id() {
+  local id="$1"
+  curl -s "${API_BASE}/v1/posts/${id}" | jq -r '.Url'
+}
+
+get_url_by_index() {
+  local idx1="$1"       # 1-based
+  if ! [[ "$idx1" =~ ^[0-9]+$ ]] || [ "$idx1" -le 0 ]; then
+    echo "Error: index must be a positive integer" >&2
+    exit 1
+  fi
+
+  local idx0=$((idx1 - 1))  # convert to 0-based
+  curl -s "${API_BASE}/v1/posts" \
+    | jq -r ".[$idx0].Url"
+}
+
+URL=""
+if [[ "$ARG" =~ ^[0-9]+$ ]]; then
+  # treat as index
+  URL="$(get_url_by_index "$ARG")"
+else
+  # treat as UUID/ID
+  URL="$(get_url_by_id "$ARG")"
+fi
+
+if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+  echo "Error: could not resolve URL for '$ARG'" >&2
+  exit 1
+fi
+
+# Display web page content in terminal via lynx
+curl -sSL "$URL" | lynx -dump -stdin

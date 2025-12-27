@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -ne 2 ]; then
+  echo "Usage: $0 <name> <url>" >&2
+  exit 1
+fi
+
+NAME="$1"
+URL="$2"
+
+API_BASE="${API_BASE:-http://localhost:8080}"
+
+if [ -z "${RSS_API_KEY:-}" ]; then
+  echo "Error: RSS_API_KEY environment variable is not set" >&2
+  echo "Export it like:" >&2
+  echo "  export RSS_API_KEY=\"<your-api-key>\"" >&2
+  exit 1
+fi
+
+curl -s -X POST "${API_BASE}/v1/feeds" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: ApiKey ${RSS_API_KEY}" \
+  -d "$(jq -n --arg name "$NAME" --arg url "$URL" '{name: $name, url: $url}')" \
+  | jq
